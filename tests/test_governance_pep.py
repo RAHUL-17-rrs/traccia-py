@@ -239,11 +239,17 @@ def test_write_check_carries_last_read_timestamp_and_customer_id():
     from traccia.governance import pep
 
     pep._last_reads.clear()
-    pep.remember_tool_result("search", {"q": "x"})
-    pep.remember_tool_result("get_refund_policy", {"as_of": "2026-09-24T11:40:00Z", "text": "policy"})
+    span = MagicMock()
+    span.context.trace_id = 5
+    span.context.span_id = 6
+    span.attributes = {}
     decision = {"id": "dec-fresh", "effect": "allow", "would_have": False, "reasons": []}
     with runtime_config.run_identity(agent_id="support", pep_enabled=True):
-        with patch("traccia.governance.pep._credentials", return_value=("key", "https://app.traccia.ai/v1/traces")):
+        with patch("traccia.context.get_current_span", return_value=span):
+            pep.remember_tool_result("search", {"q": "x"})
+            pep.remember_tool_result("get_refund_policy", {"as_of": "2026-09-24T11:40:00Z", "text": "policy"})
+        with patch("traccia.governance.pep._credentials", return_value=("key", "https://app.traccia.ai/v1/traces")), \
+             patch("traccia.context.get_current_span", return_value=span):
             with patch("traccia.governance.pep._http_session") as session:
                 session.post.return_value = MagicMock(status_code=200, json=lambda: decision)
                 enforce_tool_call("issue_refund", {"amount": 10, "customer": {"id": "alice"}})
@@ -334,3 +340,135 @@ def test_llm_check_omits_prompt_and_does_not_invent_chunk_count():
                     assert body["context"]["retrieval"] == {"present": False}
                     assert "chunk_count" not in body["context"]["retrieval"]
 
+
+# TRC-289: freshness evidence must not cross agent/run boundaries.
+
+@pytest.fixture
+def governed_tracing():
+    from traccia import get_tracer_provider, set_tracer_provider
+    from traccia.governance import pep
+    from traccia.tracer.provider import TracerProvider
+
+    previous = get_tracer_provider()
+    set_tracer_provider(TracerProvider())
+    for store in (pep._last_reads, pep._retrieval_by_trace, pep._prompt_by_trace):
+        store.clear()
+    sent = []
+
+    def _post(url, headers=None, json=None, timeout=None):
+        sent.append(json)
+        return MagicMock(status_code=200, json=lambda: {"effect": "allow", "would_have": False, "reasons": []})
+
+    with patch("traccia.governance.govern.check_agent_status"), \
+         patch("traccia.governance.pep._credentials", return_value=("key", "https://app.traccia.ai/v1/traces")), \
+         patch.object(pep._http_session, "post", side_effect=_post):
+        yield sent
+    set_tracer_provider(previous)
+
+
+def _customer_tools():
+    from traccia import observe
+
+    @observe(name="read_customer", as_type="tool")
+    def read_customer(customer_id):
+        return {"id": customer_id, "as_of": "2026-10-14T10:00:00Z"}
+
+    @observe(name="update_customer", as_type="tool")
+    def update_customer(customer_id):
+        return {"ok": True}
+
+    return read_customer, update_customer
+
+
+def _write_freshness(sent):
+    writes = [p for p in sent if p["action"]["name"] == "update_customer"]
+    return [w["context"].get("freshness") for w in writes]
+
+
+def test_freshness_does_not_leak_to_another_agent_or_run(governed_tracing):
+    from traccia.governance.govern import govern
+
+    read_customer, update_customer = _customer_tools()
+
+    @govern(agent_id="agent-a", name="run_a")
+    def run_a():
+        read_customer("cust-1")
+
+    @govern(agent_id="agent-b", name="run_b")
+    def run_b():
+        update_customer("cust-1")
+
+    @govern(agent_id="agent-a", name="run_a_again")
+    def run_a_again():
+        update_customer("cust-1")
+
+    run_a()
+    run_b()
+    run_a_again()
+    assert _write_freshness(governed_tracing) == [None, None]
+
+
+def test_freshness_kept_within_the_same_run_for_the_same_entity(governed_tracing):
+    from traccia.governance.govern import govern
+
+    read_customer, update_customer = _customer_tools()
+
+    @govern(agent_id="agent-a", name="run")
+    def run():
+        read_customer("cust-1")
+        update_customer("cust-1")
+        update_customer("cust-2")
+
+    run()
+    same, other = _write_freshness(governed_tracing)
+    assert same == [{
+        "tool": "read_customer",
+        "read_at": "2026-10-14T10:00:00Z",
+        "field": "as_of",
+        "resource_id": "cust-1",
+    }]
+    assert other is None
+
+
+def test_evidence_is_dropped_when_the_run_ends(governed_tracing):
+    from traccia import observe
+    from traccia.context import get_current_span
+    from traccia.governance import pep
+
+    read_customer, _update = _customer_tools()
+
+    @observe(name="retrieve")
+    def retrieve():
+        get_current_span().set_attribute("traccia.retrieval.chunk_count", 3)
+
+    @observe(name="rag_step")
+    def rag_step():
+        span = get_current_span()
+        pep.note_prompt_attributes(span.context.trace_id, {"traccia.prompt.name": "p"})
+        retrieve()
+        read_customer("cust-1")
+        assert len(pep._retrieval_by_trace) == 1
+        assert len(pep._prompt_by_trace) == 1
+        assert len(pep._last_reads) == 1
+
+    for _ in range(50):
+        rag_step()
+    assert len(pep._retrieval_by_trace) == 0
+    assert len(pep._prompt_by_trace) == 0
+    assert len(pep._last_reads) == 0
+
+
+def test_evidence_store_is_bounded_by_size_and_expiry():
+    from traccia.governance.evidence import EvidenceStore
+
+    store = EvidenceStore(max_entries=3, ttl_s=60)
+    for i in range(10):
+        store.update(f"t{i}", f"t{i}", lambda _old, i=i: i)
+    assert len(store) == 3
+    assert store.get("t0") is None
+    assert store.get("t9") == 9
+
+    import time
+
+    with patch("traccia.governance.evidence.time.monotonic", return_value=time.monotonic() + 61):
+        assert store.get("t9") is None
