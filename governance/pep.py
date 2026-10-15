@@ -141,11 +141,11 @@ def _resource_id(row: Any) -> Optional[str]:
 
 
 def _read_scope() -> Optional[tuple]:
-    """Freshness evidence belongs to one tenant, agent and run (trace)."""
-    trace_id = evidence.trace_key(_trace_ids()[0])
-    if not trace_id:
+    """Freshness evidence belongs to one tenant, agent and run."""
+    run = evidence.run_key(_trace_ids()[0])
+    if not run:
         return None
-    return (runtime_config.get_tenant_id() or "", _agent_id() or "", trace_id)
+    return (runtime_config.get_tenant_id() or "", _agent_id() or "", run)
 
 
 def remember_tool_result(name: str, result: Any, arguments: Optional[Dict[str, Any]] = None) -> None:
@@ -177,7 +177,7 @@ def remember_tool_result(name: str, result: Any, arguments: Optional[Dict[str, A
 
 def note_retrieval_attributes(trace_id: Optional[str], attributes: Optional[Dict[str, Any]]) -> None:
     """Record retrieval evidence only when a span already set it."""
-    key = evidence.trace_key(trace_id)
+    key = evidence.run_key(trace_id)
     if not key or not attributes:
         return
     chunk = attributes.get("traccia.retrieval.chunk_count")
@@ -210,7 +210,7 @@ def _freshness_context(resource_id: Optional[str] = None) -> list:
 
 
 def _retrieval_context(trace_id: Optional[str]) -> Dict[str, Any]:
-    key = evidence.trace_key(trace_id)
+    key = evidence.run_key(trace_id)
     if not key:
         return {"present": False}
     found = _retrieval_by_trace.get(key)
@@ -233,7 +233,7 @@ def note_prompt_attributes(trace_id: Optional[str], attributes: Optional[Dict[st
     name = attributes.get("traccia.prompt.name")
     if not name:
         return
-    key = evidence.trace_key(trace_id)
+    key = evidence.run_key(trace_id)
     if not key:
         return
     entry = {"name": str(name)}
@@ -277,7 +277,7 @@ def _prompt_context() -> Dict[str, Any]:
     from_span = _prompt_from_attributes(getattr(span, "attributes", None) if span else None)
     if from_span.get("name"):
         return from_span
-    trace_id = evidence.trace_key(_trace_ids()[0])
+    trace_id = evidence.run_key(_trace_ids()[0])
     if not trace_id:
         return from_span
     remembered = dict(_prompt_by_trace.get(trace_id) or {})

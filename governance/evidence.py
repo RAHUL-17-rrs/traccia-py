@@ -1,26 +1,32 @@
 """Bounded, run-scoped evidence the PEP sends with policy checks.
 
 Evidence (last reads, retrieval counts, compiled prompts) belongs to one run.
-Entries are keyed by trace id, dropped when the local root span ends, and
-bounded by expiry and size so traces that never end here cannot grow memory.
+A run is the current trace, or a @govern call that starts outside any trace
+(including the trace init() auto-starts, which spans every run in the process).
+Entries are dropped when the run ends and bounded by expiry and size, so runs
+that never end here cannot grow memory.
 """
 
 from __future__ import annotations
 
+import contextvars
 import threading
 import time
+import uuid
 from collections import OrderedDict
-from typing import Any, Callable, Optional
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, Optional
 
 MAX_TRACES = 1024
 TTL_S = 3600.0
 MAX_READS_PER_SCOPE = 64
 
 _lock = threading.Lock()
+_run_scope: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("traccia_evidence_run", default=None)
 
 
 class EvidenceStore:
-    """LRU map with a per-entry TTL. Each key carries the trace id it belongs to."""
+    """LRU map with a per-entry TTL. Each key carries the run key it belongs to."""
 
     def __init__(self, max_entries: int = MAX_TRACES, ttl_s: float = TTL_S) -> None:
         self.max_entries = max_entries
@@ -38,19 +44,19 @@ class EvidenceStore:
                 return None
             return value
 
-    def update(self, key: Any, trace_id: str, fn: Callable[[Any], Any]) -> None:
+    def update(self, key: Any, run: str, fn: Callable[[Any], Any]) -> None:
         """Replace the value at key with fn(current or None), refreshing its expiry."""
         with _lock:
             item = self._items.pop(key, None)
             current = None
             if item is not None and time.monotonic() - item[0] <= self.ttl_s:
                 current = item[2]
-            self._items[key] = (time.monotonic(), trace_id, fn(current))
+            self._items[key] = (time.monotonic(), run, fn(current))
             self._evict()
 
-    def forget_trace(self, trace_id: str) -> None:
+    def forget_run(self, run: str) -> None:
         with _lock:
-            for key in [k for k, item in self._items.items() if item[1] == trace_id]:
+            for key in [k for k, item in self._items.items() if item[1] == run]:
                 del self._items[key]
 
     def clear(self) -> None:
@@ -71,11 +77,11 @@ class EvidenceStore:
                 break
 
 
-# (tenant_id, agent_id, trace_id) -> {(tool, resource_id): {"tool", "read_at", "field", "resource_id"?}}
+# (tenant_id, agent_id, run) -> {(tool, resource_id): {"tool", "read_at", "field", "resource_id"?}}
 last_reads = EvidenceStore()
-# trace_id -> {"present": bool, "chunk_count": ...}
+# run -> {"present": bool, "chunk_count": ...}
 retrieval_by_trace = EvidenceStore()
-# trace_id -> {"name", "label"?, "version_id"?}
+# run -> {"name", "label"?, "version_id"?}
 prompt_by_trace = EvidenceStore()
 
 _STORES = (last_reads, retrieval_by_trace, prompt_by_trace)
@@ -90,9 +96,49 @@ def trace_key(trace_id: Any) -> Optional[str]:
     return text if text and text.strip("0") else None
 
 
+def run_key(trace_id: Any) -> Optional[str]:
+    """The run evidence belongs to: the enclosing @govern run if it opened one, else the trace."""
+    return _run_scope.get() or trace_key(trace_id)
+
+
+def _forget(run: str) -> None:
+    for store in _STORES:
+        store.forget_run(run)
+
+
 def forget_trace(trace_id: Any) -> None:
-    """Drop all evidence recorded for a finished run."""
+    """Drop all evidence recorded for a finished trace."""
     key = trace_key(trace_id)
     if key:
-        for store in _STORES:
-            store.forget_trace(key)
+        _forget(key)
+
+
+def _outside_user_trace() -> bool:
+    """No current span, or only the trace init() auto-started for the whole process."""
+    try:
+        from opentelemetry.trace import get_current_span
+
+        current = get_current_span().get_span_context()
+        if not current.is_valid:
+            return True
+        from traccia import auto
+
+        auto_span = (auto._auto_trace_context or {}).get("span")
+        return auto_span is not None and auto_span.context.span_id == format(current.span_id, "016x")
+    except Exception:
+        return False
+
+
+@contextmanager
+def governed_run() -> Iterator[None]:
+    """Open a run for a @govern call that starts outside any trace; nested calls join it."""
+    if _run_scope.get() is not None or not _outside_user_trace():
+        yield
+        return
+    run = f"run-{uuid.uuid4().hex}"
+    token = _run_scope.set(run)
+    try:
+        yield
+    finally:
+        _run_scope.reset(token)
+        _forget(run)
