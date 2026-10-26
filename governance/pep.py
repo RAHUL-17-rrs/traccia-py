@@ -23,7 +23,6 @@ _remaining_budget: Dict[str, tuple[float, float]] = {}
 _last_reads = evidence.last_reads
 _retrieval_by_trace = evidence.retrieval_by_trace
 _prompt_by_trace = evidence.prompt_by_trace
-_RESOURCE_ID_KEYS = ("resource_id", "customer_id", "id")
 _PROMPT_KEYS = ("traccia.prompt.name", "traccia.prompt.label", "traccia.prompt.version_id")
 
 
@@ -127,16 +126,19 @@ def _blocked_message(decision: Dict[str, Any]) -> str:
 
 
 def _resource_id(row: Any) -> Optional[str]:
-    """The entity a tool call reads or writes, when its arguments or result name one."""
+    """The customer a tool call reads or writes, when its arguments or result name one.
+
+    Only customer identity counts. A generic "id" (a policy or document id) does not
+    make a read customer-specific, so tool-level reads always reach the guard.
+    """
     if not isinstance(row, dict):
         return None
     customer = _customer_id(row)
     if customer:
         return customer
-    for key in _RESOURCE_ID_KEYS:
-        value = row.get(key)
-        if value not in (None, "") and not isinstance(value, (dict, list)):
-            return str(value)
+    value = row.get("customer_id")
+    if value not in (None, "") and not isinstance(value, (dict, list)):
+        return str(value)
     return None
 
 
@@ -291,6 +293,19 @@ def _customer_id(arguments: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _unresolved(reason: str, detail: str, *, warn: bool = True) -> Dict[str, Any]:
+    """No decision from Traccia. Allow, unless the @govern run is fail-closed."""
+    if not runtime_config.pep_fail_open():
+        logger.error("policy check could not complete (%s); blocking call (fail_open=False)", detail)
+        raise AgentBlockedError(
+            f"Policy check could not complete ({detail}). Blocking because fail_open is False.",
+            reasons=[reason],
+        )
+    if warn:
+        logger.warning("policy check could not complete (%s); allowing call", detail)
+    return {"effect": "allow", "would_have": False, "reasons": [reason]}
+
+
 def check_policy(
     *,
     action: Dict[str, Any],
@@ -300,10 +315,12 @@ def check_policy(
     """POST /api/v1/policy/check. Safe to call from custom tools; @govern uses this automatically."""
     api_key, endpoint = _credentials()
     if not api_key or not endpoint:
-        return {"effect": "allow", "would_have": False, "reasons": ["missing_credentials"]}
+        return _unresolved("missing_credentials", "Traccia API key or endpoint not set", warn=False)
     agent_id = _agent_id()
     if not agent_id:
-        return {"effect": "allow", "would_have": False, "reasons": ["missing_agent_id"]}
+        return _unresolved(
+            "missing_agent_id", "no agent_id on init, @govern, or TRACCIA_AGENT_ID", warn=False
+        )
     trace_id, span_id = _trace_ids()
     payload = {
         "principal": {"agent_id": agent_id},
@@ -327,16 +344,15 @@ def check_policy(
             timeout=2,
         )
         if response.status_code != 200:
-            logger.warning(
-                "policy check HTTP %s; allowing call (%s)",
-                response.status_code,
-                (response.text or "")[:180],
+            return _unresolved(
+                "check_http_error",
+                f"HTTP {response.status_code}: {(response.text or '')[:180]}",
             )
-            return {"effect": "allow", "would_have": False, "reasons": ["check_http_error"]}
         decision = response.json()
+    except AgentBlockedError:
+        raise
     except Exception as exc:
-        logger.warning("policy check failed: %s; allowing call", exc)
-        return {"effect": "allow", "would_have": False, "reasons": ["check_error"]}
+        return _unresolved("check_error", str(exc))
     _cache_budget(agent_id, decision.get("remaining_budget_usd"))
     _stamp_span(decision)
     if decision.get("would_have"):
