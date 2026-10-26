@@ -314,7 +314,8 @@ class Span:
         self._ended = True
 
         # 4. The run is over once its local root span ends; drop its policy evidence.
-        if self.parent_span_id is None:
+        # Ask the OTel span: wrappers from get_current_span() carry no parent_span_id.
+        if getattr(self._otel_span, "parent", False) is None:
             try:
                 from traccia.governance.evidence import forget_trace
 

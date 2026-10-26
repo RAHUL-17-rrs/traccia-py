@@ -1,8 +1,9 @@
 """Bounded, run-scoped evidence the PEP sends with policy checks.
 
 Evidence (last reads, retrieval counts, compiled prompts) belongs to one run.
-A run is the current trace, or a @govern call that starts outside any trace
-(including the trace init() auto-starts, which spans every run in the process).
+A run is one top-level @govern call (nested calls join it), so separate runs
+never share evidence even under one parent trace. Outside @govern the trace is
+the run.
 Entries are dropped when the run ends and bounded by expiry and size, so runs
 that never end here cannot grow memory.
 """
@@ -113,26 +114,10 @@ def forget_trace(trace_id: Any) -> None:
         _forget(key)
 
 
-def _outside_user_trace() -> bool:
-    """No current span, or only the trace init() auto-started for the whole process."""
-    try:
-        from opentelemetry.trace import get_current_span
-
-        current = get_current_span().get_span_context()
-        if not current.is_valid:
-            return True
-        from traccia import auto
-
-        auto_span = (auto._auto_trace_context or {}).get("span")
-        return auto_span is not None and auto_span.context.span_id == format(current.span_id, "016x")
-    except Exception:
-        return False
-
-
 @contextmanager
 def governed_run() -> Iterator[None]:
-    """Open a run for a @govern call that starts outside any trace; nested calls join it."""
-    if _run_scope.get() is not None or not _outside_user_trace():
+    """Open a run for a top-level @govern call; nested calls join it."""
+    if _run_scope.get() is not None:
         yield
         return
     run = f"run-{uuid.uuid4().hex}"

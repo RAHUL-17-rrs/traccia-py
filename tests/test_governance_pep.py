@@ -555,3 +555,38 @@ def test_concurrent_async_runs_keep_their_own_freshness(governed_tracing):
     }
     assert by_agent["agent-a"][0]["tool"] == "read_customer"
     assert by_agent["agent-b"] is None
+
+
+def test_ending_a_child_through_get_current_span_keeps_run_evidence(governed_tracing):
+    from opentelemetry import context
+    from opentelemetry.trace import set_span_in_context
+    from traccia import get_tracer
+    from traccia.context import get_current_span
+    from traccia.governance import pep
+
+    tracer = get_tracer("t")
+    with tracer.start_as_current_span("root") as root:
+        pep.note_retrieval_attributes(root.context.trace_id, {"traccia.retrieval.chunk_count": 2})
+        child = tracer.start_span("child")
+        token = context.attach(set_span_in_context(child._otel_span))
+        get_current_span().end()
+        context.detach(token)
+        assert len(pep._retrieval_by_trace) == 1
+    assert len(pep._retrieval_by_trace) == 0
+
+
+def test_govern_runs_under_one_parent_trace_do_not_share_reads(governed_tracing):
+    from traccia import observe
+    from traccia.governance.govern import govern
+
+    read_customer, update_customer = _customer_tools()
+    first = govern(agent_id="agent-a", name="first")(lambda: read_customer("cust-1"))
+    second = govern(agent_id="agent-a", name="second")(lambda: update_customer("cust-1"))
+
+    @observe(name="request")
+    def request():
+        first()
+        second()
+
+    request()
+    assert _write_freshness(governed_tracing) == [None]
