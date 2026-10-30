@@ -8,7 +8,7 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
-from traccia.config import load_config
+from traccia import client_config
 from traccia.governance import evidence
 from traccia.governance.policy import AgentBlockedError, ApprovalPending, _derive_base_url, _http_session
 from traccia import runtime_config
@@ -34,10 +34,7 @@ def _enrich_blocked(exc: AgentBlockedError, decision: Dict[str, Any]) -> AgentBl
 
 
 def _credentials() -> tuple[Optional[str], Optional[str]]:
-    config = load_config()
-    api_key = config.tracing.api_key or os.environ.get("TRACCIA_API_KEY")
-    endpoint = config.tracing.endpoint or os.environ.get("TRACCIA_ENDPOINT")
-    return api_key, endpoint
+    return client_config.resolve_credentials()
 
 
 def _agent_id() -> Optional[str]:
@@ -427,7 +424,11 @@ def _estimate_tokens(kwargs: Dict[str, Any]) -> Optional[int]:
     return max(len(blob) // 4, 1)
 
 
-def enforce_llm_call(kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def enforce_llm_call(
+    kwargs: Dict[str, Any], vendor: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Check policy before an LLM call. *vendor* is the span's llm.vendor; Spend Cap
+    uses it to pick that provider's price."""
     if not runtime_config.pep_enabled():
         return None
     model = kwargs.get("model")
@@ -439,6 +440,8 @@ def enforce_llm_call(kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "input_tokens": _estimate_tokens(kwargs),
         "retrieval": _retrieval_context(trace_id),
     }
+    if vendor:
+        context["vendor"] = vendor
     prompt = _prompt_context()
     if prompt:
         context["prompt"] = prompt
