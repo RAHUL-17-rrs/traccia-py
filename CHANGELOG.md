@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `enforce_llm_call()` takes an optional `vendor` and sends it with the policy check, so Spend Cap uses that provider's price. The OpenAI, Anthropic and Gemini integrations pass it
 
 ### Fixed
+- The API key and endpoint passed to `init()` are now used by policy checks, `@govern` status checks, prompts and evals, not only by tracing. Before, policy checks were skipped with `missing_credentials` and `load_prompt` raised `PromptFetchError` unless the key was also in the environment or a config file. Arguments passed to a single call still take priority
+- With an API key but no endpoint, policy checks now go to the default endpoint that traces use, instead of being skipped
 - Model ids with an organisation prefix (`openai/gpt-oss-120b`, `qwen/qwen3-32b` on Groq) get a cost. They previously matched no pricing key
 - A model listed by several providers is priced at the calling provider's rate. `gpt-oss-120b` on a Groq span took `azure_ai/gpt-oss-120b` and now takes `groq/openai/gpt-oss-120b`
 - Gemini calls (`llm.vendor` `google_gemini`) are priced at the Gemini API rate instead of Vertex AI's. A vendor matches its pricing provider family (`bedrock` also covers `bedrock_converse`), with aliases where the names differ (`google_gemini` is `gemini`)
